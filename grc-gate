@@ -1,0 +1,109 @@
+name: grc-gate
+ 
+on:
+  pull_request:
+    branches: [main]
+ 
+permissions:
+  id-token: write   # required for Cosign keyless signing (GitHub OIDC -> Sigstore Fulcio)
+  contents: read
+ 
+jobs:
+  grc-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+ 
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ vars.AWS_ACCOUNT_ID }}:role/cgep-grc-gate
+          aws-region: ${{ vars.AWS_REGION }}
+ 
+      # ------------------------------------------------------------------
+      # NOTE: The block below (plan / policy / scan -> evidence/) is your
+      # existing Lab 4.3 pipeline. Paste your real steps in here, replacing
+      # this placeholder block. The only requirement Lab 4.4 depends on is
+      # that by the time "Bundle + sign + upload to vault" runs, an
+      # evidence/ directory exists in the workspace containing the files
+      # you want signed and archived (plan output, policy results, scan
+      # results, etc).
+      # ------------------------------------------------------------------
+      - name: Terraform plan (Lab 4.3)
+        id: plan
+        if: always()
+        run: |
+          mkdir -p evidence
+          terraform init -input=false
+          terraform plan -input=false -out=tfplan.bin
+          terraform show -json tfplan.bin > evidence/plan.json
+ 
+      - name: Policy check (Lab 4.3)
+        id: policy
+        if: always()
+        run: |
+          mkdir -p evidence
+          # replace with your actual OPA/Conftest/Checkov invocation
+          conftest test evidence/plan.json --output json > evidence/policy-results.json || true
+ 
+      - name: Copy plan into evidence
+        if: always()
+        run: cp tfplan.bin evidence/ 2>/dev/null || true
+      # ------------------------------------------------------------------
+      # End of Lab 4.3 block
+      # ------------------------------------------------------------------
+ 
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: 'v2.2.4'
+ 
+      - name: Bundle + sign + upload to vault
+        id: sign
+        if: always()
+        env:
+          VAULT: ${{ vars.EVIDENCE_VAULT }}
+          RUN_ID: ${{ github.run_id }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          BUNDLE="evidence-${RUN_ID}-${SHA}.tar.gz"
+          ( cd evidence && tar czf "../${BUNDLE}" . )
+          shasum -a 256 "${BUNDLE}" | awk '{print $1}' > "${BUNDLE}.sha256"
+ 
+          cosign sign-blob --yes --bundle "${BUNDLE}.sig.bundle" "${BUNDLE}"
+ 
+          KEY_PREFIX="runs/${RUN_ID}"
+          aws s3 cp "${BUNDLE}"            "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}"
+          aws s3 cp "${BUNDLE}.sha256"     "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}.sha256"
+          aws s3 cp "${BUNDLE}.sig.bundle" "s3://${VAULT}/${KEY_PREFIX}/${BUNDLE}.sig.bundle"
+ 
+          VERSION_ID=$(aws s3api head-object --bucket "${VAULT}" --key "${KEY_PREFIX}/${BUNDLE}" --query VersionId --output text)
+          cat > receipt.json <<EOF
+          {
+            "run_id":"${RUN_ID}",
+            "vault":"${VAULT}",
+            "bundle_key":"${KEY_PREFIX}/${BUNDLE}",
+            "version_id":"${VERSION_ID}",
+            "sha256":"$(cat ${BUNDLE}.sha256)",
+            "commit":"${SHA}"
+          }
+          EOF
+          aws s3 cp receipt.json "s3://${VAULT}/${KEY_PREFIX}/receipt.json"
+ 
+      # ------------------------------------------------------------------
+      # Pass/fail decision moved to the LAST step, per Lab 4.4 instructions,
+      # so evidence is signed and stored even when the gate itself fails.
+      # Replace this with whatever condition your Lab 4.3 policy step used
+      # to determine pass/fail (e.g. checking evidence/policy-results.json).
+      # ------------------------------------------------------------------
+      - name: Enforce policy gate
+        if: always()
+        run: |
+          if [ "${{ steps.policy.outcome }}" != "success" ]; then
+            echo "Policy gate failed — evidence has been preserved in the vault."
+            exit 1
+          fi
+          echo "Policy gate passed."
+ 
